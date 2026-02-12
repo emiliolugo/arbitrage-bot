@@ -25,7 +25,7 @@ class Market:
     no_ask: Optional[float] = None
     volume: Optional[float] = None
     liquidity: Optional[float] = None
-    metadata: Dict[str, Any] = None
+    metadata: Dict[str, Any] | None = None
 
     def __post_init__(self):
         if self.metadata is None:
@@ -40,7 +40,7 @@ class Order:
     quantity: int
     price: float
     order_type: str = "limit"
-    metadata: Dict[str, Any] = None
+    metadata: Dict[str, Any] | None = None
 
     def __post_init__(self):
         if self.metadata is None:

@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 # Kalshi settings
 KALSHI_API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
 KALSHI_PRIVATE_KEY = os.getenv("KALSHI_PRIVATE_KEY")
-KALSHI_PRIVATE_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH", "backend/kalshi/main.txt")
+KALSHI_PRIVATE_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH", "keys/kalshi_private_key.pem")
 
 # Polymarket settings
 POLYMARKET_PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY")

@@ -29,6 +29,7 @@ wheels/
 *.egg
 
 # Private keys
+keys/
 *.pem
 *.key
 main.txt
@@ -53,3 +54,5 @@ data/
 # OS
 .DS_Store
 Thumbs.db
+
+AGENT_GUIDE.md

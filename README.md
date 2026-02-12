@@ -6,17 +6,27 @@ A Python-based arbitrage bot for Kalshi and Polymarket prediction markets.
 
 ```
 arb/
+├── AGENT_GUIDE.md          # Guide and conventions for AI agents
 ├── src/
 │   ├── connectors/          # Exchange connectors
 │   │   ├── base.py         # Abstract base connector
 │   │   ├── kalshi.py       # Kalshi connector
-│   │   └── polymarket.py   # Polymarket connector
+│   │   └── polymarket.py   # Polymarket connector (Gamma API, polling)
+│   ├── core/               # Core arbitrage / matching logic
+│   ├── models/             # Domain models (if/when added)
 │   └── utils/              # Shared utilities
 │       └── crypto.py       # Cryptographic utilities
-├── backend/                 # Legacy code (to be removed)
-├── example_usage.py        # Example usage script
+├── config/                 # Configuration files
+│   ├── settings.py        # Application settings
+│   └── logging_config.py  # Logging configuration
+├── data/                   # Local data storage (created at runtime)
+├── keys/                   # Private keys (not in git)
+│   └── kalshi_private_key.pem
+├── test_connectors.py      # Connector integration tests
 ├── requirements.txt        # Python dependencies
+├── pytest.ini              # Pytest configuration
 ├── .env                    # Environment variables (not in git)
+├── .gitignore             # Git ignore rules
 └── README.md              # This file
 ```
 
@@ -42,7 +52,7 @@ Create a `.env` file in the project root:
 KALSHI_API_KEY_ID=your_api_key_here
 KALSHI_PRIVATE_KEY=your_private_key_or_path_to_pem_file
 
-# Polymarket credentials
+# Polymarket credentials (for future CLOB/trading integration)
 POLYMARKET_PRIVATE_KEY=0x_your_ethereum_private_key_here
 ```
 
@@ -59,7 +69,7 @@ KALSHI_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nMIIE...your key here...\n-----E
 
 **Option B:** Store in a file and reference it:
 ```python
-kalshi = KalshiConnector(private_key_path="path/to/key.pem")
+kalshi = KalshiConnector(private_key_path="keys/kalshi_private_key.pem")
 ```
 
 ## Usage
@@ -75,7 +85,7 @@ from src.connectors import KalshiConnector
 async def main():
     # Initialize connector
     kalshi = KalshiConnector(
-        private_key_path="backend/kalshi/main.txt"
+        private_key_path="keys/kalshi_private_key.pem"
     )
 
     try:
@@ -98,7 +108,7 @@ async def main():
 asyncio.run(main())
 ```
 
-#### Polymarket Example
+#### Polymarket Example (Gamma API, polling)
 
 ```python
 import asyncio
@@ -112,7 +122,7 @@ async def main():
         # Connect
         await polymarket.connect()
 
-        # Get markets
+        # Get binary sports markets (default category="Sports")
         markets = await polymarket.get_markets()
 
         # Get specific market
@@ -124,12 +134,6 @@ async def main():
         await polymarket.disconnect()
 
 asyncio.run(main())
-```
-
-### Running Examples
-
-```bash
-python example_usage.py
 ```
 
 ## Connector API Reference
@@ -189,11 +193,11 @@ class Order:
 - ✅ Balance and position queries
 
 ### Polymarket Connector
-- ✅ CLOB API integration
-- ✅ Ethereum wallet signing
-- ✅ Market polling (no native WebSocket)
-- ✅ Order placement and cancellation
-- ✅ Position queries
+- ✅ Gamma API integration for Polymarket binary markets
+- ✅ Market polling via HTTP (no native WebSocket)
+- ✅ Binary YES/NO market filtering (2 outcomes only)
+- ⚠️ Trading (orders, balances, positions) **not yet implemented** –
+    methods intentionally raise `NotImplementedError` until a CLOB client is wired in.
 
 ## Next Steps
 
@@ -208,8 +212,8 @@ class Order:
 ### Running Tests
 
 ```bash
-# TODO: Add pytest tests
-pytest tests/
+# Run full connector integration test suite
+pytest test_connectors.py -v
 ```
 
 ### Code Style

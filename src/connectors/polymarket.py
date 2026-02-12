@@ -1,177 +1,249 @@
-"""Polymarket exchange connector."""
+"""Polymarket exchange connector using the Gamma API for market data."""
 
 import asyncio
+import json
 import logging
-from typing import Dict, List, Optional, Any, Callable
 import os
+from typing import Dict, List, Optional, Any, Callable
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+import requests
+from requests.exceptions import RequestException
+from dotenv import load_dotenv
 
 from .base import BaseConnector, Market, Order, OrderSide
 
+# Load environment variables
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 
 class PolymarketConnector(BaseConnector):
-    """Polymarket exchange connector."""
+    """Polymarket exchange connector using the Gamma API for binary sports market data."""
 
-    def __init__(
-        self,
-        private_key: Optional[str] = None,
-        host: str = "https://clob.polymarket.com",
-        chain_id: int = 137,  # Polygon mainnet
-        signature_type: int = 0  # EOA
-    ):
+    GAMMA_API_URL = "https://gamma-api.polymarket.com"
+    CLOB_API_URL = "https://clob.polymarket.com"
+
+    def __init__(self, private_key: Optional[str] = None):
         """
         Initialize Polymarket connector.
 
         Args:
-            private_key: Ethereum private key (or set POLYMARKET_PRIVATE_KEY env var)
-            host: Polymarket CLOB API host
-            chain_id: Blockchain chain ID
-            signature_type: Signature type (0 for EOA, 1 for Poly Proxy)
-
-        Raises:
-            RuntimeError: If private key is not provided
+            private_key: Polymarket wallet private key (or set POLYMARKET_PRIVATE_KEY env var)
         """
         super().__init__("Polymarket")
 
-        # Load private key
         self.private_key = private_key or os.getenv("POLYMARKET_PRIVATE_KEY")
-        if not self.private_key:
-            raise RuntimeError("Polymarket private key not provided")
-
-        self.host = host
-        self.chain_id = chain_id
-        self.signature_type = signature_type
-
-        self.client: Optional[ClobClient] = None
         self._subscriptions: Dict[str, List[Callable]] = {}
-        self._price_update_tasks: Dict[str, asyncio.Task] = {}
+        self._poll_tasks: List[asyncio.Task] = []
+        self._poll_interval = 1.0  # seconds between polls
 
         logger.info(f"Initialized {self.name} connector")
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _gamma_request(
+        self,
+        endpoint: str,
+        params: Optional[Dict] = None,
+    ) -> Any:
+        """
+        Make a GET request to the Gamma API.
+
+        Args:
+            endpoint: API endpoint path (e.g. "/events")
+            params: Query parameters
+
+        Returns:
+            Parsed JSON response
+
+        Raises:
+            RequestException: If the request fails
+        """
+        url = f"{self.GAMMA_API_URL}{endpoint}"
+        try:
+            response = requests.get(url, params=params, timeout=15)
+            response.raise_for_status()
+            return response.json()
+        except RequestException as e:
+            logger.error(f"Gamma API request failed: {e}")
+            raise
+
+    def _parse_market(self, m: Dict, event_category: str = "") -> Optional[Market]:
+        """
+        Parse a raw Gamma API market dict into a Market object.
+
+        Args:
+            m: Raw market dictionary from Gamma API
+            event_category: Category string from the parent event
+
+        Returns:
+            Market object, or None if the market is not a valid binary market
+        """
+        # Parse outcomes (JSON string → list)
+        outcomes_raw = m.get("outcomes", "[]")
+        try:
+            outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else (outcomes_raw or [])
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+        # Binary markets only (exactly 2 outcomes: Yes / No)
+        if len(outcomes) != 2:
+            return None
+
+        # Skip closed markets
+        if m.get("closed"):
+            return None
+
+        # Parse outcome prices (JSON string → list of floats)
+        prices_raw = m.get("outcomePrices", "[]")
+        try:
+            prices = json.loads(prices_raw) if isinstance(prices_raw, str) else (prices_raw or [])
+        except (json.JSONDecodeError, TypeError):
+            prices = []
+
+        # Parse CLOB token IDs (JSON string → list of strings)
+        token_ids_raw = m.get("clobTokenIds", "[]")
+        try:
+            token_ids = json.loads(token_ids_raw) if isinstance(token_ids_raw, str) else (token_ids_raw or [])
+        except (json.JSONDecodeError, TypeError):
+            token_ids = []
+
+        # Build tokens list for metadata (test suite expects this structure)
+        tokens = []
+        for i, outcome in enumerate(outcomes):
+            token = {
+                "outcome": outcome,
+                "token_id": token_ids[i] if i < len(token_ids) else None,
+                "price": float(prices[i]) if i < len(prices) and prices[i] is not None else None,
+            }
+            tokens.append(token)
+
+        # YES / NO outcome prices (Polymarket uses 0-1 scale)
+        yes_price = float(prices[0]) if len(prices) > 0 and prices[0] is not None else None
+        no_price = float(prices[1]) if len(prices) > 1 and prices[1] is not None else None
+
+        # Best bid / ask from Gamma API (reported for the YES outcome)
+        best_bid = m.get("bestBid")
+        best_ask = m.get("bestAsk")
+
+        yes_bid = float(best_bid) if best_bid is not None else None
+        yes_ask = float(best_ask) if best_ask is not None else None
+
+        # Derive NO bid / ask from the complement of YES prices
+        # Buying NO at X is equivalent to selling YES at (1 - X)
+        no_bid = round(1.0 - yes_ask, 6) if yes_ask is not None else None
+        no_ask = round(1.0 - yes_bid, 6) if yes_bid is not None else None
+
+        condition_id = m.get("conditionId", m.get("id", ""))
+
+        return Market(
+            ticker=condition_id,
+            title=m.get("question", ""),
+            yes_price=yes_price,
+            no_price=no_price,
+            yes_bid=yes_bid,
+            yes_ask=yes_ask,
+            no_bid=no_bid,
+            no_ask=no_ask,
+            volume=m.get("volumeNum"),
+            liquidity=m.get("liquidityNum"),
+            metadata={
+                "tokens": tokens,
+                "closed": m.get("closed", False),
+                "condition_id": condition_id,
+                "market_id": m.get("id"),
+                "slug": m.get("slug"),
+                "event_category": event_category,
+                "enable_order_book": m.get("enableOrderBook", False),
+                "accepting_orders": m.get("acceptingOrders", False),
+                "clob_token_ids": token_ids,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Connection lifecycle
+    # ------------------------------------------------------------------
+
     async def connect(self) -> None:
-        """Initialize Polymarket client connection."""
+        """Establish connection to Polymarket Gamma API."""
         if self._connected:
             logger.warning("Already connected to Polymarket")
             return
 
+        logger.info("Connecting to Polymarket Gamma API...")
         try:
-            self.client = ClobClient(
-                self.host,
-                key=self.private_key,
-                chain_id=self.chain_id,
-                signature_type=self.signature_type,
-            )
+            self._gamma_request("/markets", params={"limit": 1})
             self._connected = True
-            logger.info("Successfully connected to Polymarket")
+            logger.info("Successfully connected to Polymarket Gamma API")
         except Exception as e:
             logger.error(f"Failed to connect to Polymarket: {e}")
             raise
 
     async def disconnect(self) -> None:
-        """Disconnect from Polymarket."""
+        """Disconnect from Polymarket and cancel all polling tasks."""
         logger.info("Disconnecting from Polymarket...")
 
-        # Cancel all subscription tasks
-        for task in self._price_update_tasks.values():
+        for task in self._poll_tasks:
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
 
-        self._price_update_tasks.clear()
+        self._poll_tasks.clear()
         self._subscriptions.clear()
-        self.client = None
         self._connected = False
-
         logger.info("Disconnected from Polymarket")
+
+    # ------------------------------------------------------------------
+    # Market data
+    # ------------------------------------------------------------------
 
     async def get_markets(self, category: Optional[str] = None) -> List[Market]:
         """
-        Get available markets from Polymarket.
+        Get available binary sports markets from Polymarket via the Gamma API.
+
+        Uses the /events endpoint to naturally group markets by category.
 
         Args:
-            category: Optional category filter (not directly supported by API)
+            category: Category filter (defaults to "Sports", pass "" for all)
 
         Returns:
-            List of Market objects
+            List of binary Market objects
         """
-        if not self.client:
-            raise RuntimeError("Not connected to Polymarket")
+        # Default to sports category
+        if category is None:
+            category = "Sports"
+
+        params = {
+            "closed": "false",
+            "limit": 100,
+        }
 
         try:
-            # Get all markets
-            markets_data = self.client.get_markets()
+            events = self._gamma_request("/events", params=params)
 
-            markets = []
-            for m in markets_data:
-                # Polymarket has condition tokens, each market can have multiple outcomes
-                # For binary markets, there are usually YES/NO tokens
-                tokens = m.get("tokens", [])
+            binary_markets = []
+            for event in events:
+                event_category = event.get("category", "") or ""
 
-                # Get orderbook for each token to get prices
-                yes_token = None
-                no_token = None
+                # Filter by category (empty string = no filter)
+                if category and category.lower() not in event_category.lower():
+                    continue
 
-                for token in tokens:
-                    outcome = token.get("outcome", "").upper()
-                    if outcome == "YES":
-                        yes_token = token
-                    elif outcome == "NO":
-                        no_token = token
+                for m in event.get("markets", []):
+                    market = self._parse_market(m, event_category=event_category)
+                    if market is not None:
+                        binary_markets.append(market)
 
-                market = Market(
-                    ticker=m.get("condition_id", ""),
-                    title=m.get("question", ""),
-                    volume=m.get("volume"),
-                    liquidity=m.get("liquidity"),
-                    metadata=m
-                )
-
-                # Fetch prices for tokens if available
-                if yes_token:
-                    token_id = yes_token.get("token_id")
-                    if token_id:
-                        try:
-                            book = self.client.get_order_book(token_id)
-                            if book:
-                                bids = book.get("bids", [])
-                                asks = book.get("asks", [])
-                                market.yes_bid = float(bids[0]["price"]) if bids else None
-                                market.yes_ask = float(asks[0]["price"]) if asks else None
-                        except Exception as e:
-                            logger.debug(f"Failed to get orderbook for {token_id}: {e}")
-
-                if no_token:
-                    token_id = no_token.get("token_id")
-                    if token_id:
-                        try:
-                            book = self.client.get_order_book(token_id)
-                            if book:
-                                bids = book.get("bids", [])
-                                asks = book.get("asks", [])
-                                market.no_bid = float(bids[0]["price"]) if bids else None
-                                market.no_ask = float(asks[0]["price"]) if asks else None
-                        except Exception as e:
-                            logger.debug(f"Failed to get orderbook for {token_id}: {e}")
-
-                markets.append(market)
-
-            # Apply category filter if specified
-            if category:
-                category_lower = category.lower()
-                markets = [
-                    m for m in markets
-                    if category_lower in m.title.lower() or
-                    category_lower in str(m.metadata.get("tags", [])).lower()
-                ]
-
-            return markets
+            logger.info(
+                f"Fetched {len(binary_markets)} binary markets from Polymarket "
+                f"(category={category!r})"
+            )
+            return binary_markets
 
         except Exception as e:
             logger.error(f"Failed to get markets: {e}")
@@ -179,208 +251,122 @@ class PolymarketConnector(BaseConnector):
 
     async def get_market(self, ticker: str) -> Optional[Market]:
         """
-        Get specific market by ticker (condition_id).
+        Get a specific market by ticker (conditionId).
 
         Args:
-            ticker: Market condition_id
+            ticker: Market conditionId
 
         Returns:
-            Market object or None
+            Market object or None if not found
         """
-        if not self.client:
-            raise RuntimeError("Not connected to Polymarket")
-
         try:
-            markets = await self.get_markets()
-            for market in markets:
-                if market.ticker == ticker:
-                    return market
-            return None
+            markets = self._gamma_request(
+                "/markets",
+                params={"condition_ids": ticker, "limit": 1},
+            )
+
+            if not markets:
+                return None
+
+            m = markets[0]
+
+            # Try to extract event category from nested events
+            event_category = ""
+            events = m.get("events", [])
+            if events:
+                event_category = events[0].get("category", "") or ""
+
+            return self._parse_market(m, event_category=event_category)
+
         except Exception as e:
             logger.error(f"Failed to get market {ticker}: {e}")
             return None
 
-    async def _poll_market_updates(self, ticker: str, token_id: str, interval: float = 1.0) -> None:
+    def filter_active_markets(self, markets: List[Market]) -> List[Market]:
         """
-        Poll market for price updates.
+        Filter for markets that have active pricing data.
 
         Args:
-            ticker: Market ticker
-            token_id: Token ID to poll
-            interval: Polling interval in seconds
+            markets: List of Market objects
+
+        Returns:
+            Subset of markets that have at least one bid or ask price
         """
-        while ticker in self._subscriptions:
+        return [
+            m for m in markets
+            if any([
+                m.yes_bid is not None,
+                m.yes_ask is not None,
+                m.no_bid is not None,
+                m.no_ask is not None,
+            ])
+        ]
+
+    # ------------------------------------------------------------------
+    # Subscriptions (polling-based)
+    # ------------------------------------------------------------------
+
+    async def subscribe_market(self, ticker: str, callback: Callable) -> None:
+        """
+        Subscribe to market updates via polling.
+
+        Args:
+            ticker: Market conditionId
+            callback: Async callback receiving Market updates
+        """
+        if ticker not in self._subscriptions:
+            self._subscriptions[ticker] = []
+
+        self._subscriptions[ticker].append(callback)
+
+        # Spin up a polling task for this ticker
+        task = asyncio.create_task(self._poll_market(ticker))
+        self._poll_tasks.append(task)
+
+        logger.info(f"Subscribed to market {ticker} (polling every {self._poll_interval}s)")
+
+    async def _poll_market(self, ticker: str) -> None:
+        """Poll the Gamma API for market updates and invoke callbacks."""
+        while True:
             try:
-                book = self.client.get_order_book(token_id)
-                if book:
-                    market = Market(
-                        ticker=ticker,
-                        title="",  # Would need to fetch full market data
-                        metadata=book
-                    )
-
-                    bids = book.get("bids", [])
-                    asks = book.get("asks", [])
-
-                    # Assuming YES token (adjust based on your needs)
-                    market.yes_bid = float(bids[0]["price"]) if bids else None
-                    market.yes_ask = float(asks[0]["price"]) if asks else None
-
-                    # Call callbacks
+                market = await self.get_market(ticker)
+                if market and ticker in self._subscriptions:
                     for callback in self._subscriptions[ticker]:
                         try:
                             await callback(market)
                         except Exception as e:
                             logger.error(f"Callback error for {ticker}: {e}")
-
-                await asyncio.sleep(interval)
-
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error polling market {ticker}: {e}")
-                await asyncio.sleep(interval)
+                logger.error(f"Polling error for {ticker}: {e}")
 
-    async def subscribe_market(self, ticker: str, callback: Callable) -> None:
-        """
-        Subscribe to market updates (via polling).
+            await asyncio.sleep(self._poll_interval)
 
-        Note: Polymarket doesn't have native WebSocket support in py_clob_client,
-        so we poll the API for updates.
-
-        Args:
-            ticker: Market ticker (condition_id)
-            callback: Async callback function receiving Market updates
-        """
-        if not self.client:
-            raise RuntimeError("Not connected to Polymarket")
-
-        if ticker not in self._subscriptions:
-            self._subscriptions[ticker] = []
-
-            # Get token_id for this market
-            market = await self.get_market(ticker)
-            if market and market.metadata:
-                tokens = market.metadata.get("tokens", [])
-                if tokens:
-                    token_id = tokens[0].get("token_id")
-                    if token_id:
-                        # Start polling task
-                        task = asyncio.create_task(
-                            self._poll_market_updates(ticker, token_id)
-                        )
-                        self._price_update_tasks[ticker] = task
-
-        self._subscriptions[ticker].append(callback)
-        logger.info(f"Subscribed to market {ticker}")
+    # ------------------------------------------------------------------
+    # Trading stubs (require CLOB client integration)
+    # ------------------------------------------------------------------
 
     async def place_order(self, order: Order) -> Dict[str, Any]:
-        """
-        Place order on Polymarket.
-
-        Args:
-            order: Order object
-
-        Returns:
-            Order response
-
-        Note: You'll need to map ticker to token_id and handle the order properly
-        """
-        if not self.client:
-            raise RuntimeError("Not connected to Polymarket")
-
-        try:
-            # Get token_id from ticker
-            market = await self.get_market(order.ticker)
-            if not market or not market.metadata:
-                raise ValueError(f"Market {order.ticker} not found")
-
-            tokens = market.metadata.get("tokens", [])
-            if not tokens:
-                raise ValueError(f"No tokens found for market {order.ticker}")
-
-            # For now, assume first token (you should select based on YES/NO)
-            token_id = tokens[0].get("token_id")
-
-            # Map OrderSide to Polymarket side
-            side = "BUY" if order.side == OrderSide.BUY else "SELL"
-
-            # Create order
-            order_args = OrderArgs(
-                token_id=token_id,
-                price=order.price,
-                size=order.quantity,
-                side=side,
-                fee_rate_bps=0,  # Adjust as needed
-            )
-
-            # Create and post order
-            signed_order = self.client.create_order(order_args)
-            response = self.client.post_order(signed_order)
-
-            logger.info(f"Order placed: {response}")
-            return response
-
-        except Exception as e:
-            logger.error(f"Failed to place order: {e}")
-            raise
+        """Place order on Polymarket (requires CLOB client – not yet implemented)."""
+        raise NotImplementedError(
+            "Polymarket order placement requires CLOB client integration"
+        )
 
     async def cancel_order(self, order_id: str) -> bool:
-        """
-        Cancel order.
-
-        Args:
-            order_id: Order ID
-
-        Returns:
-            True if successful
-        """
-        if not self.client:
-            raise RuntimeError("Not connected to Polymarket")
-
-        try:
-            self.client.cancel_order(order_id)
-            logger.info(f"Order {order_id} cancelled")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to cancel order {order_id}: {e}")
-            return False
+        """Cancel order on Polymarket (requires CLOB client – not yet implemented)."""
+        raise NotImplementedError(
+            "Polymarket order cancellation requires CLOB client integration"
+        )
 
     async def get_balance(self) -> Dict[str, float]:
-        """
-        Get account balance.
-
-        Returns:
-            Balance information
-        """
-        if not self.client:
-            raise RuntimeError("Not connected to Polymarket")
-
-        try:
-            # Get USDC balance (Polymarket uses USDC)
-            address = self.client.get_address()
-            # Note: py_clob_client may not have direct balance API
-            # You may need to query blockchain directly
-            logger.warning("Balance API not fully implemented")
-            return {"address": address}
-        except Exception as e:
-            logger.error(f"Failed to get balance: {e}")
-            return {}
+        """Get account balance (requires CLOB client – not yet implemented)."""
+        raise NotImplementedError(
+            "Polymarket balance retrieval requires CLOB client integration"
+        )
 
     async def get_positions(self) -> List[Dict[str, Any]]:
-        """
-        Get current positions.
-
-        Returns:
-            List of positions
-        """
-        if not self.client:
-            raise RuntimeError("Not connected to Polymarket")
-
-        try:
-            # Get open orders as positions
-            orders = self.client.get_orders()
-            return orders
-        except Exception as e:
-            logger.error(f"Failed to get positions: {e}")
-            return []
+        """Get current positions (requires CLOB client – not yet implemented)."""
+        raise NotImplementedError(
+            "Polymarket position retrieval requires CLOB client integration"
+        )

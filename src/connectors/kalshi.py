@@ -6,6 +6,7 @@ import logging
 import time
 from typing import Dict, List, Optional, Any, Callable
 import os
+from dotenv import load_dotenv
 
 import websockets
 import requests
@@ -14,6 +15,8 @@ from requests.exceptions import RequestException
 from .base import BaseConnector, Market, Order, OrderSide
 from ..utils.crypto import load_private_key_from_file, load_private_key_from_string, sign_pss_text
 
+# Load environment variables
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -44,20 +47,21 @@ class KalshiConnector(BaseConnector):
         """
         super().__init__("Kalshi")
 
-        # Load API key
+        # Load API and private keys
         self.api_key = api_key or os.getenv("KALSHI_API_KEY_ID")
         if not self.api_key:
             raise RuntimeError("Kalshi API key not provided")
 
-        # Load private key
-        if private_key_path:
-            self.private_key = load_private_key_from_file(private_key_path)
-        elif private_key_string:
+        # Load private key - priority: string > file path > env var
+        if private_key_string:
             self.private_key = load_private_key_from_string(private_key_string)
-        elif "KALSHI_PRIVATE_KEY" in os.environ:
-            self.private_key = load_private_key_from_string(os.getenv("KALSHI_PRIVATE_KEY"))
+        elif private_key_path:
+            self.private_key = load_private_key_from_file(private_key_path)
         else:
-            raise RuntimeError("Kalshi private key not provided")
+            key_str = os.getenv("KALSHI_PRIVATE_KEY")
+            if not key_str:
+                raise RuntimeError("Kalshi private key not provided")
+            self.private_key = load_private_key_from_string(key_str)
 
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
         self._subscriptions: Dict[str, List[Callable]] = {}
@@ -217,7 +221,7 @@ class KalshiConnector(BaseConnector):
         """Parse orderbook update into Market object."""
         ticker = data.get("ticker", "")
 
-        # Extract best bid/ask from orderbook
+        # Extract best bid/ask from orderbook and normalize from cents to decimal
         yes_bids = data.get("yes_bids", [])
         yes_asks = data.get("yes_asks", [])
         no_bids = data.get("no_bids", [])
@@ -226,10 +230,10 @@ class KalshiConnector(BaseConnector):
         return Market(
             ticker=ticker,
             title=data.get("title", ""),
-            yes_bid=yes_bids[0]["price"] if yes_bids else None,
-            yes_ask=yes_asks[0]["price"] if yes_asks else None,
-            no_bid=no_bids[0]["price"] if no_bids else None,
-            no_ask=no_asks[0]["price"] if no_asks else None,
+            yes_bid=yes_bids[0]["price"] / 100.0 if yes_bids else None,
+            yes_ask=yes_asks[0]["price"] / 100.0 if yes_asks else None,
+            no_bid=no_bids[0]["price"] / 100.0 if no_bids else None,
+            no_ask=no_asks[0]["price"] / 100.0 if no_asks else None,
             metadata=data
         )
 
@@ -254,15 +258,20 @@ class KalshiConnector(BaseConnector):
 
     async def get_markets(self, category: Optional[str] = None) -> List[Market]:
         """
-        Get available markets from Kalshi.
+        Get available binary sports markets from Kalshi.
 
         Args:
-            category: Optional category filter (e.g., "Sports")
+            category: Optional category filter (defaults to "Sports" if not specified)
 
         Returns:
-            List of Market objects
+            List of binary Market objects
         """
         params = {}
+
+        # Default to sports category
+        if category is None:
+            category = "Sports"
+
         if category:
             params["category"] = category
 
@@ -270,20 +279,47 @@ class KalshiConnector(BaseConnector):
             response = await self._api_request("GET", "/markets", params=params)
             markets = response.get("markets", [])
 
-            return [
-                Market(
-                    ticker=m.get("ticker", ""),
-                    title=m.get("title", ""),
-                    yes_bid=m.get("yes_bid"),
-                    yes_ask=m.get("yes_ask"),
-                    no_bid=m.get("no_bid"),
-                    no_ask=m.get("no_ask"),
-                    volume=m.get("volume"),
-                    liquidity=m.get("liquidity"),
-                    metadata=m
+            binary_markets = []
+            for m in markets:
+                # Filter for binary markets only
+                # Check if market has exactly 2 outcomes or is a yes/no market
+                market_type = m.get("market_type", "").lower()
+                num_outcomes = m.get("num_outcomes")
+
+                # Kalshi binary markets typically have market_type="binary" or num_outcomes=2
+                is_binary = (
+                    market_type == "binary" or
+                    num_outcomes == 2 or
+                    (m.get("yes_bid") is not None or m.get("yes_ask") is not None or
+                     m.get("no_bid") is not None or m.get("no_ask") is not None)
                 )
-                for m in markets
-            ]
+
+                if not is_binary:
+                    continue
+
+                # Normalize prices from cents (0-100) to decimal (0-1)
+                yes_bid = m.get("yes_bid") / 100.0 if m.get("yes_bid") is not None else None
+                yes_ask = m.get("yes_ask") / 100.0 if m.get("yes_ask") is not None else None
+                no_bid = m.get("no_bid") / 100.0 if m.get("no_bid") is not None else None
+                no_ask = m.get("no_ask") / 100.0 if m.get("no_ask") is not None else None
+
+                binary_markets.append(
+                    Market(
+                        ticker=m.get("ticker", ""),
+                        title=m.get("title", ""),
+                        yes_bid=yes_bid,
+                        yes_ask=yes_ask,
+                        no_bid=no_bid,
+                        no_ask=no_ask,
+                        volume=m.get("volume"),
+                        liquidity=m.get("liquidity"),
+                        metadata=m
+                    )
+                )
+
+            logger.info(f"Fetched {len(binary_markets)} binary sports markets from Kalshi")
+            return binary_markets
+
         except Exception as e:
             logger.error(f"Failed to get markets: {e}")
             return []
