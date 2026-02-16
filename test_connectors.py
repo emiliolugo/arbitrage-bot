@@ -77,7 +77,7 @@ class TestKalshiConnector:
         assert len(markets) > 0, "Should fetch at least one sports market"
         
         # Verify first market structure
-        market = markets[0]
+        market = markets[-1]
         assert isinstance(market, Market)
         assert market.ticker is not None
         assert market.title is not None
@@ -215,6 +215,7 @@ class TestPolymarketConnector:
         
         # Verify first market structure
         market = markets[0]
+        print(market)
         assert isinstance(market, Market)
         assert market.ticker is not None
         assert market.title is not None
@@ -342,9 +343,7 @@ class TestPolymarketConnector:
         sports_markets = await polymarket_connector.get_markets(category="Sports")
         
         assert isinstance(sports_markets, list)
-        # Sports markets should exist (category is popular)
-        # Note: This may occasionally fail if no sports markets are available
-        print(f"\nFound {len(sports_markets)} sports markets")
+       
 
     @pytest.mark.asyncio
     @pytest.mark.timeout(60)

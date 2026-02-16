@@ -221,23 +221,27 @@ class PolymarketConnector(BaseConnector):
         params = {
             "closed": "false",
             "limit": 100,
+            "sports_market_types": ["moneyline", "spreads", "totals"],
         }
 
         try:
-            events = self._gamma_request("/events", params=params)
+            markets = self._gamma_request("/markets", params=params)
 
             binary_markets = []
-            for event in events:
-                event_category = event.get("category", "") or ""
+            for m in markets:
+                # Extract event category from nested events
+                event_category = ""
+                events = m.get("events", [])
+                if events:
+                    event_category = events[0].get("category", "") or ""
 
                 # Filter by category (empty string = no filter)
-                if category and category.lower() not in event_category.lower():
+                if category and event_category and category.lower() not in event_category.lower():
                     continue
 
-                for m in event.get("markets", []):
-                    market = self._parse_market(m, event_category=event_category)
-                    if market is not None:
-                        binary_markets.append(market)
+                market = self._parse_market(m, event_category=event_category)
+                if market is not None:
+                    binary_markets.append(market)
 
             logger.info(
                 f"Fetched {len(binary_markets)} binary markets from Polymarket "

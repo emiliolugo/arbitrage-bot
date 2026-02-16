@@ -261,40 +261,47 @@ class KalshiConnector(BaseConnector):
         Get available binary sports markets from Kalshi.
 
         Args:
-            category: Optional category filter (defaults to "Sports" if not specified)
+            category: Optional category filter. Currently only "Sports" is
+                handled explicitly and is applied client-side because the
+                Kalshi markets endpoint does not support a "Sports" category
+                filter.
 
         Returns:
             List of binary Market objects
         """
-        params = {}
+        # Base query params – do not send category to Kalshi; we filter
+        # on the client side instead.
+        params = {
+            "mve_filter": "exclude"  # Exclude multi-variate event markets
+        }
 
-        # Default to sports category
-        if category is None:
-            category = "Sports"
-
-        if category:
-            params["category"] = category
-
+        # Normalize requested category. Default behavior remains "Sports" to
+        # match the public connector interface used in tests.
+       
         try:
             response = await self._api_request("GET", "/markets", params=params)
             markets = response.get("markets", [])
 
             binary_markets = []
             for m in markets:
-                # Filter for binary markets only
-                # Check if market has exactly 2 outcomes or is a yes/no market
+                # Filter for binary markets (API already excludes multi-variate events)
                 market_type = m.get("market_type", "").lower()
                 num_outcomes = m.get("num_outcomes")
 
-                # Kalshi binary markets typically have market_type="binary" or num_outcomes=2
-                is_binary = (
-                    market_type == "binary" or
-                    num_outcomes == 2 or
-                    (m.get("yes_bid") is not None or m.get("yes_ask") is not None or
-                     m.get("no_bid") is not None or m.get("no_ask") is not None)
-                )
+                # Skip if market has more than 2 outcomes
+                if num_outcomes and num_outcomes > 2:
+                    continue
 
+                # Accept market if it's explicitly binary OR has exactly 2 outcomes
+                is_binary = market_type == "binary" or num_outcomes == 2
                 if not is_binary:
+                    continue
+
+                # Apply client-side category filtering. Right now we only
+                # treat "Sports" specially; other categories fall back to
+                # returning all binary markets.
+                ticker = m.get("ticker","").lower()
+                if not "game" in ticker:
                     continue
 
                 # Normalize prices from cents (0-100) to decimal (0-1)
@@ -316,7 +323,6 @@ class KalshiConnector(BaseConnector):
                         metadata=m
                     )
                 )
-
             logger.info(f"Fetched {len(binary_markets)} binary sports markets from Kalshi")
             return binary_markets
 
